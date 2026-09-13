@@ -1,0 +1,104 @@
+name: CI
+
+# push to main covers direct commits (rare on a protected branch); the real
+# gate is pull_request against main, which runs on every PR before merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege default for the whole workflow: read-only. A job that
+# genuinely needs more (e.g. pushing a release tag) declares it on that job
+# specifically, not here -- narrowing blast radius if a step is ever
+# compromised via a malicious dependency or action.
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the still-running CI for the previous
+# push -- without this, every force-push or rapid commit queues another
+# full run and you burn Actions minutes on results nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a full commit SHA, not a floating tag like @v4. A tag can
+      # be moved by the action's maintainer (or an attacker who compromises
+      # their account) to point at different code without you noticing --
+      # the SHA is the actual content you audited.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db # v6.1.1
+        with:
+          version: latest
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -race catches data races that only show up under concurrent
+      # scheduling -- cheap to run now, expensive to debug in production.
+      # -coverprofile feeds the coverage gate below; without it the next
+      # step has nothing to check.
+      - name: Run tests with race detector and coverage
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      # go test's own summary doesn't fail the build on low coverage --
+      # this step is what actually enforces the threshold. Adjust 70 as
+      # the real codebase grows; a fresh repo's true baseline is whatever
+      # you're comfortable defending, not a number copied from a blog post.
+      - name: Enforce minimum coverage
+        run: |
+          set -euo pipefail
+          coverage=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Total coverage: ${coverage}%"
+          if (( $(echo "$coverage < 70" | bc -l) )); then
+            echo "::error::Coverage ${coverage}% is below the 70% minimum"
+            exit 1
+          fi
+
+  build:
+    # Only build after lint and test both pass -- no point compiling code
+    # that already failed review, and it keeps the Actions minutes spent
+    # on a doomed PR to a minimum.
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # CGO_ENABLED=0 produces a fully static binary -- no runtime
+      # dependency on the host's libc, which matters the moment this gets
+      # built once here and run in a different environment (a container,
+      # a different Linux distro) than it was compiled on.
+      - name: Build
+        run: CGO_ENABLED=0 go build -o bin/githubaction .
+
+      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2 # v4.5.0
+        with:
+          name: githubaction-binary
+          path: bin/githubaction
+          # Build artifacts are for debugging a specific CI run, not
+          # long-term storage -- default retention (90 days) just
+          # accumulates cost for artifacts nobody will ever download again.
+          retention-days: 7

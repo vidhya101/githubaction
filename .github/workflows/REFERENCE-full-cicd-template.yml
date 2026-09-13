@@ -1,0 +1,390 @@
+# ==============================================================================
+# Workflow:    REFERENCE — Full CI/CD Parameter Catalogue
+# Description: Every GitHub Actions concept a professional pipeline actually
+#              reaches for, in one annotated file. NOT meant to run as-is
+#              end to end -- it's a menu. The main pipeline (lint -> test ->
+#              security-scan -> build -> deploy-staging) is live, working
+#              YAML you can copy directly. Sections marked ALTERNATE /
+#              SITUATIONAL are commented out because they're mutually
+#              exclusive with what's already active, or only apply to
+#              specific pipeline shapes (a reusable workflow, a release
+#              pipeline, a scheduled scan) -- copy the block you need.
+# Author:      Vidhya Shanker
+# Created:     2026-08-27
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# WORKFLOW-LEVEL: name, run-name
+# ------------------------------------------------------------------------------
+name: CI/CD
+
+# run-name overrides what shows in the Actions tab per-run. Without it every
+# run just shows the workflow name -- this makes the run list scannable
+# when you have many runs from different actors/branches at once.
+run-name: ${{ github.workflow }} on ${{ github.ref_name }} by @${{ github.actor }}
+
+# ------------------------------------------------------------------------------
+# TRIGGERS (`on`)
+# ------------------------------------------------------------------------------
+# ACTIVE: the two triggers almost every pipeline needs.
+on:
+  push:
+    branches: [main]
+    # Skip a full CI run when only docs changed -- saves real Actions
+    # minutes on a busy repo. Remove if docs changes should still be linted.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+    # types defaults to [opened, synchronize, reopened] if omitted -- listed
+    # explicitly here so it's visible this is a deliberate choice, not an
+    # accident. Add "labeled" if you gate on a PR label somewhere below.
+    types: [opened, synchronize, reopened]
+
+  # ALTERNATE -- manual run button in the Actions UI, with typed inputs.
+  # Useful for "redeploy without a new commit" or "run this against a
+  # specific environment on demand." Every input type GitHub supports:
+  # workflow_dispatch:
+  #   inputs:
+  #     environment:
+  #       description: "Target environment"
+  #       required: true
+  #       type: choice
+  #       options: [staging, production]
+  #     debug_enabled:
+  #       description: "Run with tmate debugging enabled"
+  #       required: false
+  #       type: boolean
+  #       default: false
+  #     release_notes:
+  #       description: "Freeform notes for this manual run"
+  #       required: false
+  #       type: string
+
+  # ALTERNATE -- cron schedule. UTC always. This example: 03:00 UTC daily.
+  # Typical use: nightly dependency/vulnerability scan, not your main
+  # build/test/deploy pipeline (that should run on push/PR, not a timer).
+  # schedule:
+  #   - cron: "0 3 * * *"
+
+  # ALTERNATE -- makes THIS workflow callable from another workflow
+  # (`uses: ./.github/workflows/this-file.yml`). This is how you eliminate
+  # duplicated pipeline logic across repos/branches -- write once, call from
+  # many. Mutually exclusive in practice with being a top-level pipeline
+  # people trigger directly, though technically you can have both.
+  # workflow_call:
+  #   inputs:
+  #     environment:
+  #       required: true
+  #       type: string
+  #   secrets:
+  #     deploy-token:
+  #       required: true
+  #   outputs:
+  #     image-tag:
+  #       description: "The image tag this run built"
+  #       value: ${{ jobs.build.outputs.image-tag }}
+
+  # ALTERNATE -- fires on GitHub Release creation. Typical use: a separate
+  # publish/deploy pipeline distinct from the PR-validation pipeline above.
+  # release:
+  #   types: [published]
+
+# ------------------------------------------------------------------------------
+# PERMISSIONS -- every scope GitHub Actions recognizes, all set to the
+# least-privilege default. A job that needs more declares it on THAT job
+# specifically (see the `deploy-staging` job below for a real example) --
+# never widen this top-level block for one job's sake.
+# ------------------------------------------------------------------------------
+permissions:
+  actions: none
+  checks: none
+  contents: read # read is the floor for actions/checkout to work at all
+  deployments: none
+  id-token: none # set to `write` only on jobs doing OIDC cloud auth
+  issues: none
+  discussions: none
+  packages: none # set to `write` only on jobs pushing to GHCR
+  pages: none
+  pull-requests: none # set to `write` only on jobs that comment on PRs
+  repository-projects: none
+  security-events: none # set to `write` only on jobs uploading SARIF (CodeQL etc.)
+  statuses: none
+
+# ------------------------------------------------------------------------------
+# CONCURRENCY -- cancel a superseded run instead of letting it finish and
+# burn Actions minutes on a result nobody will read.
+# ------------------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ------------------------------------------------------------------------------
+# WORKFLOW-LEVEL ENV -- visible to every job/step below. Put things here
+# that are truly global (a registry hostname); put things that vary per
+# job in that job's own `env:` instead (see `test` job below).
+# ------------------------------------------------------------------------------
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# ------------------------------------------------------------------------------
+# DEFAULTS -- applied to every `run:` step unless a step overrides it.
+# working-directory here saves repeating `cd subdir &&` on every step in a
+# monorepo; shell here is mostly relevant on Windows runners.
+# ------------------------------------------------------------------------------
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # LINT -- fast, fails first, nothing downstream wastes minutes on
+  # already-broken code.
+  # ----------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db # v6.1.1
+        with:
+          version: latest
+
+  # ----------------------------------------------------------------------------
+  # TEST -- matrix strategy: every combination of go-version x os runs as
+  # its own job, in parallel. fail-fast: false means one failing
+  # combination doesn't cancel the others -- you want to see ALL the
+  # failures from one push, not just the first.
+  # ----------------------------------------------------------------------------
+  test:
+    needs: [lint]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4 # cap concurrent runners -- avoids hogging the whole org's runner queue
+      matrix:
+        go-version: ["1.22", "1.23"]
+        os: [ubuntu-latest, macos-latest]
+        # `include` adds one specific extra combination without a full
+        # cross-product; `exclude` removes one combination that doesn't
+        # make sense (e.g. a Windows-only dependency test on macOS).
+        include:
+          - go-version: "1.23"
+            os: ubuntu-latest
+            experimental: true
+    # A job-level env, scoped only to this job's steps -- distinct from the
+    # workflow-level env above.
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      # SERVICE CONTAINER: a sidecar Postgres for integration tests. Only
+      # this job gets it -- lint/build never pay the container-startup cost.
+      # (Commented because main.go in this demo repo has no DB dependency;
+      # uncomment services: below the moment a test actually needs one.)
+      # services:
+      #   postgres:
+      #     image: postgres:16
+      #     env:
+      #       POSTGRES_PASSWORD: postgres
+      #     ports: ["5432:5432"]
+      #     options: >-
+      #       --health-cmd pg_isready
+      #       --health-interval 10s
+      #       --health-timeout 5s
+      #       --health-retries 5
+
+      - name: Run tests with race detector and coverage
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Enforce minimum coverage
+        run: |
+          set -euo pipefail
+          coverage=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Total coverage: ${coverage}%"
+          if (( $(echo "$coverage < 70" | bc -l) )); then
+            echo "::error::Coverage ${coverage}% is below the 70% minimum"
+            exit 1
+          fi
+
+      # continue-on-error on an EXPERIMENTAL matrix leg only -- a failure
+      # here shows as a warning, not a red X, and doesn't block the merge.
+      # Never do this on a leg that represents your actual support matrix.
+      - name: Experimental-only check
+        if: matrix.experimental == true
+        continue-on-error: true
+        run: echo "placeholder for a check you're not ready to enforce yet"
+
+  # ----------------------------------------------------------------------------
+  # SECURITY-SCAN -- runs in parallel with test (both only need lint), not
+  # after it. Two independent scanners: CodeQL for code-level vulns,
+  # Trivy for dependency/container CVEs. security-events: write is scoped
+  # to just this job, matching the least-privilege pattern from the
+  # top-level permissions block.
+  # ----------------------------------------------------------------------------
+  security-scan:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: github/codeql-action/init@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.27.0
+        with:
+          languages: go
+
+      - uses: github/codeql-action/analyze@ce28f5bb42b7a9f2c824e633a3f6ee835bab6858 # v3.27.0
+
+      - uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.29.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1" # fail the job on a critical/high finding -- a scan nobody enforces isn't a gate, it's decoration
+
+  # ----------------------------------------------------------------------------
+  # BUILD -- only after everything upstream is green. Demonstrates job
+  # OUTPUTS: the image tag computed here is consumed by deploy-staging
+  # below without either job needing to know how the other computed it.
+  # ----------------------------------------------------------------------------
+  build:
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      image-tag: ${{ steps.compute-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - id: compute-tag
+        name: Compute image tag
+        run: echo "tag=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -o bin/githubaction .
+
+      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2 # v4.5.0
+        with:
+          name: githubaction-binary
+          path: bin/githubaction
+          retention-days: 7
+
+      # GITHUB_STEP_SUMMARY writes to the run's Summary tab -- a
+      # human-readable result without needing to open the raw logs.
+      - name: Write job summary
+        run: |
+          echo "### Build result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image tag: \`${{ steps.compute-tag.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------------
+  # DEPLOY-STAGING -- the two things that make a deploy job different from
+  # a build job: an `environment:` (ties to a GitHub Environment with
+  # required-reviewer approval configured in Settings -> Environments --
+  # the YAML alone does nothing without that protection rule existing) and
+  # OIDC federated cloud auth (id-token: write, no long-lived AWS/Azure/GCP
+  # keys stored as repo secrets at all).
+  # ----------------------------------------------------------------------------
+  deploy-staging:
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # This is the actual approval gate. GitHub pauses the job here and
+    # waits for a reviewer to click Approve in the Actions UI -- configure
+    # required reviewers on the "staging" environment in repo Settings.
+    environment:
+      name: staging
+      url: https://staging.example.com
+    permissions:
+      contents: read
+      id-token: write # OIDC token issuance -- this is what replaces a static AWS_SECRET_ACCESS_KEY
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: githubaction-binary
+          path: bin/
+
+      # OIDC exchange: GitHub issues a short-lived token; AWS trusts it via
+      # an IAM role's trust policy naming this specific repo. No secret
+      # ever sits in GitHub -- there's nothing to leak or rotate.
+      # - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/github-actions-deploy
+      #     aws-region: us-east-1
+
+      - name: Deploy
+        run: |
+          echo "deploying image tag ${{ needs.build.outputs.image-tag }} to staging"
+          chmod +x bin/githubaction
+
+  # ----------------------------------------------------------------------------
+  # NOTIFY-ON-FAILURE -- runs regardless of upstream outcome (`always()`),
+  # but its own steps check the actual result. This is the pattern that
+  # gets a real alert into Slack instead of someone noticing a red X three
+  # days later.
+  # ----------------------------------------------------------------------------
+  notify-on-failure:
+    needs: [lint, test, security-scan, build, deploy-staging]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report which job failed
+        run: |
+          echo "::error::Pipeline failed -- check the Actions tab for the specific job"
+      # SECURITY NOTE: github.event.head_commit.message is attacker-controlled
+      # free text -- a committer can put anything in a commit message,
+      # including characters that break JSON structure or, in a run: step,
+      # shell metacharacters that execute as code. Never interpolate it (or
+      # any github.event.*.title/body/message field) directly into a run:
+      # command or an action's `with:` string. Route it through env: first --
+      # env: is expanded by the shell as a plain variable, not re-parsed as
+      # a command, which is what actually neutralizes the injection.
+      # - uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v2.0.0
+      #   env:
+      #     COMMIT_MSG: ${{ github.event.head_commit.message }}
+      #   with:
+      #     webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+      #     webhook-type: incoming-webhook
+      #     payload: |
+      #       {"text": "CI failed on ${{ github.repository }}@${{ github.ref_name }}: ${{ env.COMMIT_MSG }}"}
+
+# ==============================================================================
+# NOT COVERED ABOVE, WORTH KNOWING EXISTS:
+#
+# - Composite actions (.github/actions/my-action/action.yml): package a
+#   repeated block of steps into one reusable `uses:` line, scoped to a
+#   single repo (vs. workflow_call, which is a full reusable workflow).
+# - `if:` conditionals using the full expression syntax --
+#   github.event_name, github.event.pull_request.draft,
+#   startsWith(github.ref, 'refs/tags/'), etc.
+# - Dependabot (.github/dependabot.yml) -- not a workflow file at all, but
+#   the other half of "keep dependencies current," feeding PRs THIS
+#   pipeline then validates.
+# - Branch protection rules (required status checks, required reviews) --
+#   configured in repo Settings, not YAML; this pipeline's job names are
+#   what you'd select there as required checks.
+# ==============================================================================
